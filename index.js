@@ -2,19 +2,19 @@ const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const fetch = require("node-fetch");
 
 const TMDB_KEY = process.env.TMDB_KEY;
-const GEMINI_KEY = process.env.GEMINI_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash-lite";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const IMG = "https://image.tmdb.org/t/p/";
+const PREFIX = "ar:";
 const extra = [{ name: "search" }, { name: "skip" }];
 
 const manifest = {
   id: "community.arabic.meta",
-  version: "1.2.0",
+  version: "2.0.0",
   name: "ترجمة عربية",
   description: "عناوين ووصف وبوسترات بالعربي",
   resources: ["catalog", "meta"],
   types: ["movie", "series"],
-  idPrefixes: ["tt"],
+  idPrefixes: [PREFIX],
   catalogs: [
     { type: "movie", id: "ar-movies", name: "أفلام (عربي)", extra },
     { type: "series", id: "ar-series", name: "مسلسلات (عربي)", extra }
@@ -31,15 +31,15 @@ async function tmdb(path, params = "", lang = "ar") {
 }
 
 async function toArabic(text) {
-  if (!GEMINI_KEY || !text) return text;
+  if (!GEMINI_API_KEY || !text) return text;
   if (trCache.has(text)) return trCache.get(text);
   try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${GEMINI_API_KEY}`;
     const res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_KEY },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: "ترجم وصف الفلم التالي إلى العربية الفصحى المبسطة. أرجع الترجمة فقط بدون أي إضافات:\n\n" + text }] }]
+        contents: [{ parts: [{ text: "ترجم الوصف التالي إلى العربية الفصحى المبسطة. أرجع الترجمة فقط:\n\n" + text }] }]
       })
     });
     const data = await res.json();
@@ -47,6 +47,30 @@ async function toArabic(text) {
     if (out) { trCache.set(text, out); return out; }
   } catch (e) {}
   return text;
+}
+
+async function getEpisodes(tvId, imdb) {
+  const show = await tmdb(`/tv/${tvId}`);
+  const seasons = (show.seasons || []).filter((s) => s.season_number > 0);
+  const results = await Promise.all(
+    seasons.map((s) => tmdb(`/tv/${tvId}/season/${s.season_number}`))
+  );
+  const videos = [];
+  for (const s of results) {
+    for (const ep of s.episodes || []) {
+      if (!ep.air_date) continue;
+      videos.push({
+        id: `${imdb}:${ep.season_number}:${ep.episode_number}`,
+        title: ep.name || `الحلقة ${ep.episode_number}`,
+        season: ep.season_number,
+        episode: ep.episode_number,
+        released: new Date(ep.air_date).toISOString(),
+        thumbnail: ep.still_path ? IMG + "w300" + ep.still_path : undefined,
+        overview: ep.overview
+      });
+    }
+  }
+  return videos;
 }
 
 builder.defineCatalogHandler(async ({ type, extra }) => {
@@ -69,7 +93,7 @@ builder.defineCatalogHandler(async ({ type, extra }) => {
         }
         if (!imdb) return null;
         return {
-          id: imdb,
+          id: PREFIX + imdb,
           type,
           name: item.title || item.name,
           description: item.overview,
@@ -85,27 +109,31 @@ builder.defineCatalogHandler(async ({ type, extra }) => {
 
 builder.defineMetaHandler(async ({ type, id }) => {
   try {
-    const data = await tmdb(`/find/${id}`, "&external_source=imdb_id");
+    const imdb = id.replace(PREFIX, "");
+    const data = await tmdb(`/find/${imdb}`, "&external_source=imdb_id");
     const item = type === "movie" ? data.movie_results[0] : data.tv_results[0];
     if (!item) return { meta: null };
 
     let description = item.overview;
     if (!description) {
-      const en = await tmdb(`/find/${id}`, "&external_source=imdb_id", "en-US");
+      const en = await tmdb(`/find/${imdb}`, "&external_source=imdb_id", "en-US");
       const enItem = type === "movie" ? en.movie_results[0] : en.tv_results[0];
       description = await toArabic(enItem && enItem.overview);
     }
 
-    return {
-      meta: {
-        id,
-        type,
-        name: item.title || item.name,
-        description,
-        poster: item.poster_path ? IMG + "w500" + item.poster_path : undefined,
-        background: item.backdrop_path ? IMG + "w1280" + item.backdrop_path : undefined
-      }
+    const meta = {
+      id,
+      type,
+      name: item.title || item.name,
+      description,
+      poster: item.poster_path ? IMG + "w500" + item.poster_path : undefined,
+      background: item.backdrop_path ? IMG + "w1280" + item.backdrop_path : undefined
     };
+
+    if (type === "movie") meta.behaviorHints = { defaultVideoId: imdb };
+    else meta.videos = await getEpisodes(item.id, imdb);
+
+    return { meta };
   } catch (e) {
     return { meta: null };
   }
