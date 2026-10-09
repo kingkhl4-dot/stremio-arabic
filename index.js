@@ -36,32 +36,57 @@ const GEMINI_MODELS = [
   "gemini-2.5-flash-lite"
 ];
 
+const isArabic = (value) => {
+  if (!value) return false;
+  const arabic = (value.match(/[\u0600-\u06FF]/g) || []).length;
+  const latin = (value.match(/[A-Za-z]/g) || []).length;
+  return arabic > 0 && arabic >= latin;
+};
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 async function toArabic(text) {
-  if (!GEMINI_API_KEY || !text) return text;
+  if (!text || isArabic(text)) return text;
+  if (!GEMINI_API_KEY) {
+    console.log("Gemini translation skipped: missing API key");
+    return text;
+  }
   if (trCache.has(text)) return trCache.get(text);
   for (const model of GEMINI_MODELS) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: "ترجم الوصف التالي إلى العربية الفصحى المبسطة. أرجع الترجمة فقط:\n\n" + text }] }]
-        })
-      });
-      const data = await res.json();
-      const out = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-      if (out) {
-        console.log("Gemini OK:", model);
-        trCache.set(text, out);
-        return out;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: "ترجم الوصف التالي إلى العربية الفصحى المبسطة. أرجع الترجمة العربية فقط:\\n\\n" + text }] }],
+            generationConfig: { temperature: 0.2 }
+          })
+        });
+        const data = await res.json();
+        const out = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || "").join("").trim();
+        if (res.ok && isArabic(out)) {
+          trCache.set(text, out);
+          console.log("Gemini OK:", model);
+          return out;
+        }
+        console.log("Gemini failed:", model, "status:", res.status,
+          "attempt:", attempt + 1, "reason:", data.error?.message || data.candidates?.[0]?.finishReason || "empty/non-Arabic response");
+        if (![429, 500, 502, 503, 504].includes(res.status)) break;
+        if (attempt === 0) await wait(650);
+      } catch (e) {
+        console.log("Gemini exception:", model, e.message);
+        if (attempt === 0) await wait(650);
       }
-      console.log("Gemini failed:", model, JSON.stringify(data.error || data).slice(0, 200));
-    } catch (e) {
-      console.log("Gemini exception:", model, e.message);
     }
   }
-  return text;
+  return text; // Keep original English description if translation fails.
+}
+
+async function getArabicDescription(kind, tmdbId, overview) {
+  if (isArabic(overview)) return overview;
+  const english = await tmdb(`/${kind}/${tmdbId}`, "", "en-US");
+  return toArabic(english.overview || overview || "");
 }
 
 async function getEpisodes(tvId, imdb) {
@@ -132,11 +157,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
     const item = await tmdb(`/${kind}/${found.id}`, "&append_to_response=credits");
 
-        let description = item.overview;
-    if (!description || !/[\u0600-\u06FF]/.test(description)) {
-      const en = await tmdb(`/${kind}/${found.id}`, "", "en-US");
-      description = await toArabic(en.overview || description);
-    }
+        const description = await getArabicDescription(kind, found.id, item.overview);
 
     const date = item.release_date || item.first_air_date || "";
     const credits = item.credits || {};
