@@ -30,7 +30,7 @@ async function tmdb(path, params = "", lang = "ar") {
   return (await fetch(url)).json();
 }
 
-const GEMINI_MODELS = ["gemini-3.1-flash-lite"];
+const GEMINI_MODELS = ["gemini-3.5-flash-lite"];
 const isArabic = (value) => {
   if (!value) return false;
   const arabic = (value.match(/[\u0600-\u06FF]/g) || []).length;
