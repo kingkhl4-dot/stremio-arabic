@@ -110,16 +110,26 @@ builder.defineCatalogHandler(async ({ type, extra }) => {
 builder.defineMetaHandler(async ({ type, id }) => {
   try {
     const imdb = id.replace(PREFIX, "");
+    const kind = type === "movie" ? "movie" : "tv";
     const data = await tmdb(`/find/${imdb}`, "&external_source=imdb_id");
-    const item = type === "movie" ? data.movie_results[0] : data.tv_results[0];
-    if (!item) return { meta: null };
+    const found = type === "movie" ? data.movie_results[0] : data.tv_results[0];
+    if (!found) return { meta: null };
+
+    const item = await tmdb(`/${kind}/${found.id}`, "&append_to_response=credits");
 
     let description = item.overview;
     if (!description) {
-      const en = await tmdb(`/find/${imdb}`, "&external_source=imdb_id", "en-US");
-      const enItem = type === "movie" ? en.movie_results[0] : en.tv_results[0];
-      description = await toArabic(enItem && enItem.overview);
+      const en = await tmdb(`/${kind}/${found.id}`, "", "en-US");
+      description = await toArabic(en.overview);
     }
+
+    const date = item.release_date || item.first_air_date || "";
+    const credits = item.credits || {};
+    const director =
+      type === "movie"
+        ? (credits.crew || []).filter((c) => c.job === "Director").map((c) => c.name)
+        : (item.created_by || []).map((c) => c.name);
+    const runtime = type === "movie" ? item.runtime : (item.episode_run_time || [])[0];
 
     const meta = {
       id,
@@ -127,11 +137,18 @@ builder.defineMetaHandler(async ({ type, id }) => {
       name: item.title || item.name,
       description,
       poster: item.poster_path ? IMG + "w500" + item.poster_path : undefined,
-      background: item.backdrop_path ? IMG + "w1280" + item.backdrop_path : undefined
+      background: item.backdrop_path ? IMG + "w1280" + item.backdrop_path : undefined,
+      genres: (item.genres || []).map((g) => g.name),
+      releaseInfo: date.slice(0, 4),
+      released: date ? new Date(date).toISOString() : undefined,
+      imdbRating: item.vote_average ? item.vote_average.toFixed(1) : undefined,
+      runtime: runtime ? `${runtime} د` : undefined,
+      cast: (credits.cast || []).slice(0, 8).map((c) => c.name),
+      director
     };
 
     if (type === "movie") meta.behaviorHints = { defaultVideoId: imdb };
-    else meta.videos = await getEpisodes(item.id, imdb);
+    else meta.videos = await getEpisodes(found.id, imdb);
 
     return { meta };
   } catch (e) {
