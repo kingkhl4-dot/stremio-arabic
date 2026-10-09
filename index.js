@@ -117,10 +117,10 @@ builder.defineMetaHandler(async ({ type, id }) => {
 
     const item = await tmdb(`/${kind}/${found.id}`, "&append_to_response=credits");
 
-    let description = item.overview;
-    if (!description) {
+        let description = item.overview;
+    if (!description || !/[\u0600-\u06FF]/.test(description)) {
       const en = await tmdb(`/${kind}/${found.id}`, "", "en-US");
-      description = await toArabic(en.overview);
+      description = await toArabic(en.overview || description);
     }
 
     const date = item.release_date || item.first_air_date || "";
