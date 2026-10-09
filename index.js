@@ -38,7 +38,7 @@ const isArabic = (value) => {
   return arabic > 0 && arabic >= latin;
 };
 let geminiQuotaBlockedUntil = 0;
-const GEMINI_QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+const GEMINI_QUOTA_COOLDOWN_MS = 15 * 60 * 1000;
 
 async function toArabic(text) {
   if (!text || isArabic(text)) return text;
@@ -65,7 +65,7 @@ async function toArabic(text) {
     }
     if (res.status === 429) {
       geminiQuotaBlockedUntil = Date.now() + GEMINI_QUOTA_COOLDOWN_MS;
-      console.log("Gemini quota exceeded: pausing translation requests for 24 hours");
+      console.log("Gemini rate limit reached: pausing translation requests for 15 minutes");
       return text;
     }
     if (!res.ok) {
