@@ -30,22 +30,37 @@ async function tmdb(path, params = "", lang = "ar") {
   return (await fetch(url)).json();
 }
 
+const GEMINI_MODELS = [
+  "gemini-3.1-flash-lite",
+  "gemini-3.1-flash-lite-preview",
+  "gemini-2.5-flash-lite"
+];
+
 async function toArabic(text) {
   if (!GEMINI_API_KEY || !text) return text;
   if (trCache.has(text)) return trCache.get(text);
-  try {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=${GEMINI_API_KEY}`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: "ترجم الوصف التالي إلى العربية الفصحى المبسطة. أرجع الترجمة فقط:\n\n" + text }] }]
-      })
-    });
-    const data = await res.json();
-    const out = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-    if (out) { trCache.set(text, out); return out; }
-  } catch (e) {}
+  for (const model of GEMINI_MODELS) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: "ترجم الوصف التالي إلى العربية الفصحى المبسطة. أرجع الترجمة فقط:\n\n" + text }] }]
+        })
+      });
+      const data = await res.json();
+      const out = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+      if (out) {
+        console.log("Gemini OK:", model);
+        trCache.set(text, out);
+        return out;
+      }
+      console.log("Gemini failed:", model, JSON.stringify(data.error || data).slice(0, 200));
+    } catch (e) {
+      console.log("Gemini exception:", model, e.message);
+    }
+  }
   return text;
 }
 
