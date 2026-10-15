@@ -25,6 +25,47 @@ const builder = new addonBuilder(manifest);
 const idCache = new Map();
 const trCache = new Map();
 
+const CF_ACCOUNT = process.env.CLOUDFLARE_ACCOUNT_ID;
+const CF_DATABASE = process.env.CLOUDFLARE_DATABASE_ID;
+const CF_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+
+async function d1Query(sql, params) {
+  if (!CF_ACCOUNT || !CF_DATABASE || !CF_TOKEN) return null;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4500);
+    let response;
+    try {
+      response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT}/d1/database/${CF_DATABASE}/query`, {
+        method: "POST",
+        signal: controller.signal,
+        headers: { Authorization: `Bearer ${CF_TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ sql, params })
+      });
+    } finally { clearTimeout(timer); }
+    if (!response.ok) { console.log("D1 HTTP status:", response.status); return null; }
+    const data = await response.json();
+    if (!data.success || !data.result?.[0]?.success) {
+      console.log("D1 query failed:", JSON.stringify(data.errors || data.result?.[0]?.error || []).slice(0, 300));
+      return null;
+    }
+    return data.result[0].results || [];
+  } catch (e) {
+    console.log("D1 unavailable:", e.message);
+    return null;
+  }
+}
+
+async function storedArabic(kind, tmdbId) {
+  const rows = await d1Query("SELECT arabic_description FROM translations WHERE content_id = ? LIMIT 1", [kind + ":" + tmdbId]);
+  return rows?.[0]?.arabic_description || null;
+}
+async function saveArabic(kind, tmdbId, description) {
+  if (!isArabic(description)) return;
+  await d1Query("INSERT INTO translations (content_id, arabic_description, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(content_id) DO UPDATE SET arabic_description = excluded.arabic_description, updated_at = CURRENT_TIMESTAMP", [kind + ":" + tmdbId, description]);
+}
+
+
 async function tmdb(path, params = "", lang = "ar") {
   const url = `https://api.themoviedb.org/3${path}?api_key=${TMDB_KEY}&language=${lang}${params}`;
   return (await fetch(url)).json();
@@ -85,9 +126,29 @@ async function toArabic(text) {
 }
 
 async function getArabicDescription(kind, tmdbId, overview) {
-  if (isArabic(overview)) return overview;
-  const english = await tmdb(`/${kind}/${tmdbId}`, "", "en-US");
-  return toArabic(english.overview || overview || "");
+  const key = kind + ":" + tmdbId;
+  if (isArabic(overview)) {
+    trCache.set(key, overview);
+    return overview;
+  }
+  if (trCache.has(key)) return trCache.get(key);
+  const saved = await storedArabic(kind, tmdbId);
+  if (saved && isArabic(saved)) {
+    trCache.set(key, saved);
+    return saved;
+  }
+  try {
+    const english = await tmdb(`/${kind}/${tmdbId}`, "", "en-US");
+    const result = await toArabic(english.overview || overview || "");
+    if (isArabic(result)) {
+      trCache.set(key, result);
+      await saveArabic(kind, tmdbId, result);
+    }
+    return result;
+  } catch (e) {
+    console.log("Description lookup failed:", e.message);
+    return overview || "";
+  }
 }
 
 async function getEpisodes(tvId, imdb) {
@@ -123,26 +184,53 @@ builder.defineCatalogHandler(async ({ type, extra }) => {
         ? await tmdb(`/search/${kind}`, `&query=${encodeURIComponent(extra.search)}&page=${page}`)
         : await tmdb(`/${kind}/popular`, `&page=${page}`);
 
-    const metas = await Promise.all(
-      (data.results || []).map(async (item) => {
-        const key = kind + item.id;
-        let imdb = idCache.get(key);
-        if (!imdb) {
-          const ext = await tmdb(`/${kind}/${item.id}/external_ids`);
-          imdb = ext.imdb_id;
-          if (imdb) idCache.set(key, imdb);
+    // Load saved descriptions in one D1 query, then translate missing ones in small batches.
+    const catalogItems = data.results || [];
+    const contentIds = catalogItems.map(item => kind + ":" + item.id);
+    const savedRows = contentIds.length
+      ? await d1Query(
+          "SELECT content_id, arabic_description FROM translations WHERE content_id IN (" + contentIds.map(() => "?").join(",") + ")",
+          contentIds
+        )
+      : [];
+    const savedDescriptions = new Map((savedRows || []).map(row => [row.content_id, row.arabic_description]));
+    const metas = [];
+    // Limit simultaneous Gemini calls to reduce rate-limit errors.
+    for (let i = 0; i < catalogItems.length; i += 4) {
+      const batch = catalogItems.slice(i, i + 4);
+      const results = await Promise.all(batch.map(async item => {
+        try {
+          const key = kind + item.id;
+          let imdb = idCache.get(key);
+          if (!imdb) {
+            const ext = await tmdb(`/${kind}/${item.id}/external_ids`);
+            imdb = ext.imdb_id;
+            if (imdb) idCache.set(key, imdb);
+          }
+          if (!imdb) return null;
+          const saved = savedDescriptions.get(kind + ":" + item.id);
+          const description = saved && isArabic(saved)
+            ? saved
+            : await getArabicDescription(kind, item.id, item.overview);
+          return {
+            id: PREFIX + imdb,
+            type,
+            name: item.title || item.name,
+            description,
+            poster: item.poster_path ? IMG + "w500" + item.poster_path : undefined,
+            background: item.backdrop_path ? IMG + "w1280" + item.backdrop_path : undefined,
+            imdbRating: item.vote_average ? item.vote_average.toFixed(1) : undefined,
+            releaseInfo: (item.release_date || item.first_air_date || "").slice(0, 4)
+          };
+        } catch (error) {
+          console.log("Catalog item failed:", error.message);
+          return null;
         }
-        if (!imdb) return null;
-        return {
-          id: PREFIX + imdb,
-          type,
-          name: item.title || item.name,
-          description: item.overview,
-          poster: item.poster_path ? IMG + "w500" + item.poster_path : undefined
-        };
-      })
-    );
-    return { metas: metas.filter(Boolean) };
+      }));
+      metas.push(...results.filter(Boolean));
+    }
+    return { metas };
+
   } catch (e) {
     return { metas: [] };
   }
